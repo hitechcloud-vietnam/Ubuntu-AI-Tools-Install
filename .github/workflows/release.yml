@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install shellcheck + bats
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck bats
+
+      - name: Shellcheck
+        run: |
+          shellcheck --severity=warning ubuntu-prep-setup.sh
+          [ -f llama-reconfigure.sh ] && shellcheck --severity=warning llama-reconfigure.sh || true
+
+      - name: Bash syntax
+        run: |
+          bash -n ubuntu-prep-setup.sh
+          [ -f llama-reconfigure.sh ] && bash -n llama-reconfigure.sh || true
+
+      - name: Bats test suite
+        run: bats tests/
+
+      - name: Extract version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify at least one included script matches the tag
+        env:
+          TAG_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          # The repo ships multiple versioned scripts; the tag represents
+          # the repo's release number. Require that at least one script's
+          # internal version matches the tag (proves something was actually
+          # bumped for this release). Scripts that didn't change this
+          # release keep their previous version.
+          MATCHED=false
+
+          INSTALLER_V=$(grep -oP 'UBUNTU_PREP_VERSION="\K[^"]+' ubuntu-prep-setup.sh | head -1 || true)
+          echo "ubuntu-prep-setup.sh     version: ${INSTALLER_V}"
+          [ "$INSTALLER_V" = "$TAG_VERSION" ] && MATCHED=true
+
+          if [ -f llama-reconfigure.sh ]; then
+            RECONFIGURE_V=$(grep -oP 'LLAMA_RECONFIGURE_VERSION="\K[^"]+' llama-reconfigure.sh | head -1 || true)
+            echo "llama-reconfigure.sh     version: ${RECONFIGURE_V}"
+            [ "$RECONFIGURE_V" = "$TAG_VERSION" ] && MATCHED=true
+          fi
+
+          echo "tag                                : ${TAG_VERSION}"
+
+          if [ "$MATCHED" = "false" ]; then
+            echo "❌ No script version matches tag v${TAG_VERSION}. Bump the version"
+            echo "   constant in whichever script(s) changed for this release."
+            exit 1
+          fi
+          echo "✅ At least one script's version matches tag v${TAG_VERSION}."
+
+      - name: Generate SHA256SUMS
+        run: |
+          {
+            sha256sum ubuntu-prep-setup.sh
+            [ -f llama-reconfigure.sh ] && sha256sum llama-reconfigure.sh
+          } > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          # Pull the section between "## [VERSION]" and the next "## [" header.
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]"   { inside=1; next }
+            inside && /^## \[/         { exit }
+            inside                     { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "⚠️  No CHANGELOG entry found for ${VERSION} — using fallback."
+            printf 'Release %s\n\nSee [CHANGELOG.md](CHANGELOG.md).\n' "$VERSION" > RELEASE_NOTES.md
+          fi
+
+          echo "--- release notes preview ---"
+          cat RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Build the asset list dynamically so old tags (pre-llama-reconfigure)
+          # don't fail the release step.
+          ASSETS=(ubuntu-prep-setup.sh SHA256SUMS)
+          [ -f llama-reconfigure.sh ] && ASSETS+=(llama-reconfigure.sh)
+
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file RELEASE_NOTES.md \
+            "${ASSETS[@]}"

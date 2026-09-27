@@ -1,0 +1,66 @@
+name: OpenClaw Compatibility Check
+
+on:
+  schedule:
+    # Run daily at 08:00 UTC (1:00 AM Pacific)
+    - cron: '0 8 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  issues: write   # needed to create/list issues
+  contents: read  # needed for actions/checkout
+
+
+jobs:
+  check-openclaw:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check OpenClaw npm package & installer compatibility
+        run: bash tests/check-openclaw-compat.sh
+
+      - name: Create issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Ensure the label exists (idempotent)
+          gh label create openclaw-compat \
+            --repo "$GH_REPO" \
+            --color "fbca04" \
+            --description "OpenClaw install/compatibility regressions" \
+            2>/dev/null || true
+
+          # Skip if an open openclaw-compat issue already exists
+          OPEN=$(gh issue list --repo "$GH_REPO" \
+                   --label openclaw-compat --state open --json number --jq 'length')
+          if [ "${OPEN:-0}" -gt 0 ]; then
+            echo "Open issue already exists — skipping creation."
+            exit 0
+          fi
+
+          BODY="The daily OpenClaw compatibility check failed."
+          BODY+=$'\n\n'
+          BODY+="This means the \`openclaw\` npm package or installer may have changed "
+          BODY+="in a way that breaks our direct \`npm install -g openclaw\` approach "
+          BODY+="in \`ubuntu-prep-setup.sh\`."
+          BODY+=$'\n\n'
+          BODY+="**Action needed:** Review the [workflow run](${RUN_URL}) and update \`install_openclaw()\` if necessary."
+          BODY+=$'\n\n'
+          BODY+="Common changes to watch for:"$'\n'
+          BODY+="- \`bin\` field in package.json renamed (binary no longer called \`openclaw\`)"$'\n'
+          BODY+="- \`onboard\` subcommand renamed or removed"$'\n'
+          BODY+="- Install method changed from npm to something else"$'\n'
+          BODY+="- Package moved to a different npm scope (e.g. \`@openclaw/cli\`)"$'\n'
+          BODY+="- \`@beta\` tag removed or renamed"
+
+          gh issue create \
+            --repo "$GH_REPO" \
+            --title "⚠️ OpenClaw compatibility check failed" \
+            --label "openclaw-compat" \
+            --body "$BODY"
